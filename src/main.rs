@@ -4,14 +4,14 @@ use std::error::Error;
 use ipnetwork::IpNetwork;
 use std::env;
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process;
 use std::collections::HashMap;
 use std::thread;
 use std::sync::Arc;
 use pnet::datalink::{self, NetworkInterface};
-use pnet::packet::arp::ArpPacket;
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
+use pnet::packet::arp::*;
+use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::vlan::{Vlan, VlanPacket};
 use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::icmpv6::Icmpv6Packet;
@@ -20,9 +20,10 @@ use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
+use pnet::packet::{Packet, MutablePacket};
 use pnet::util::MacAddr;
 use pnet::datalink::Channel::Ethernet;
+use pnet::datalink::DataLinkSender;
 use std::alloc::dealloc;
 
 
@@ -56,7 +57,7 @@ struct Stats {
     rx_pkts_dropped_unsupported: u64,
     ipv4: PktStats,
     ipv6: PktStats,
-    arp: PktStats,
+    arp: ArpStats,
     vlan: VlanStats,
 }
 
@@ -71,6 +72,20 @@ struct VlanStats {
 }
 
 #[derive(Debug, Default)]
+struct ArpStats {
+    rx_pkts: u64,
+    rx_pkts_request: u64,
+    rx_pkts_reply: u64,
+    rx_pkts_dropped_not_for_us: u64,
+    rx_pkts_dropped_has_vlan: u64,
+    rx_pkts_dropped_malformed: u64,
+    rx_pkts_dropped_no_vlan: u64,
+    rx_pkts_dropped_unsupported: u64,
+    tx_pkts_reply: u64,
+    tx_pkts_request: u64,
+}
+
+#[derive(Debug, Default)]
 struct PktStats {
     rx_pkts: u64,
     tx_pkts: u64,
@@ -78,6 +93,12 @@ struct PktStats {
     rx_pkts_dropped_not_for_us: u64,
     rx_pkts_dropped_malformed: u64,
     rx_pkts_dropped_no_vlan: u64,
+}
+
+struct Chan {
+    stats: Stats,
+    tx: Box<dyn DataLinkSender>,
+    interface: NetworkInterface,
 }
 
 fn main() {
@@ -123,182 +144,260 @@ fn main() {
 fn handle_ethernet_channel(intf: NetworkInterface, cfg: CfgIntf) {
     debug!("opening an ethernet channel on interface '{}'", intf.name);
 
-    let mut stats: Stats = Default::default();
-
     // Create an ethernet channel to send and receive on
     let (tx, mut rx) = match datalink::channel(&intf, Default::default()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("unsupported channel type: {}"),
         Err(e) => panic!("unable to create channel: {}", e),
     };
+
+    let mut chan = Chan { tx, interface: intf, stats: Default::default()};
+
     loop {
         match rx.next() {
             Ok(packet) => {
-                stats.rx_pkts += 1;
-                handle_ethernet_frame(&intf, &EthernetPacket::new(packet).unwrap(), &cfg, &mut stats);
+                chan.stats.rx_pkts += 1;
+                handle_ethernet_frame(&EthernetPacket::new(packet).unwrap(), &cfg, &mut chan);
             }
-            Err(e) => panic!("unable to receive packets on interface {}: {}", intf.name, e),
+            Err(e) => panic!("unable to receive packets on interface {}: {}", chan.interface.name, e),
         }
-        debug!("stats:\n{:#?}", stats);
+        debug!("stats:\n{:#?}", chan.stats);
     }
 }
 
-fn handle_ethernet_frame(interface: &NetworkInterface, ethernet: &EthernetPacket, cfg: &CfgIntf, stats: &mut Stats) {
-    let interface_name = &interface.name[..];
-
+fn handle_ethernet_frame(ethernet: &EthernetPacket, cfg: &CfgIntf, chan: &mut Chan) {
     match ethernet.get_ethertype() {
         EtherTypes::Ipv4 => {
-            stats.ipv4.rx_pkts += 1;
+            chan.stats.ipv4.rx_pkts += 1;
             match cfg {
                 CfgIntf::Untagged(ip) => {
-                    handle_ipv4_packet(interface_name, ethernet.payload(), ip, stats);
+                    handle_ipv4_packet(ethernet.payload(), ip, chan);
                 },
                 CfgIntf::Tagged(_) => {
-                    stats.ipv4.rx_pkts_dropped_no_vlan += 1;
+                    chan.stats.ipv4.rx_pkts_dropped_no_vlan += 1;
                 }
             }
         },
         EtherTypes::Ipv6 => {
-            stats.ipv6.rx_pkts += 1;
+            chan.stats.ipv6.rx_pkts += 1;
             match cfg {
                 CfgIntf::Untagged(ip) => {
-                    handle_ipv6_packet(interface_name, ethernet.payload(), ip, stats);
+                    handle_ipv6_packet(ethernet.payload(), ip, chan);
                 },
                 CfgIntf::Tagged(_) => {
-                    stats.ipv6.rx_pkts_dropped_no_vlan += 1;
+                    chan.stats.ipv6.rx_pkts_dropped_no_vlan += 1;
                 }
             }
         },
         EtherTypes::Arp => {
-            stats.arp.rx_pkts += 1;
+            chan.stats.arp.rx_pkts += 1;
             match cfg {
                 CfgIntf::Untagged(ip) => {
-                    handle_arp_packet(interface_name, ethernet, ip, stats);
+                    handle_arp_packet(ethernet, ip, chan);
                 },
                 CfgIntf::Tagged(_) => {
-                    stats.arp.rx_pkts_dropped_no_vlan += 1;
+                    chan.stats.arp.rx_pkts_dropped_no_vlan += 1;
                 }
             }
         },
         EtherTypes::Vlan => {
-            stats.vlan.rx_pkts += 1;
+            chan.stats.vlan.rx_pkts += 1;
             match cfg {
                 CfgIntf::Untagged(_) => {
-                    stats.vlan.rx_pkts_dropped_has_vlan += 1;
+                    chan.stats.vlan.rx_pkts_dropped_has_vlan += 1;
                 },
                 CfgIntf::Tagged(vlans) => {
-                    handle_vlan_packet(interface_name, ethernet, vlans, stats);
+                    handle_vlan_packet(ethernet, vlans, chan);
                 }
             }
         },
-        _ => stats.rx_pkts_dropped_unsupported += 1
+        _ => chan.stats.rx_pkts_dropped_unsupported += 1
     }
 }
 
-fn handle_vlan_packet(interface_name: &str, ethernet: &EthernetPacket, cfg: &CfgVlans, stats: &mut Stats) {
+fn handle_vlan_packet(ethernet: &EthernetPacket, cfg: &CfgVlans, chan: &mut Chan) {
     if let Some(vlan) = VlanPacket::new(ethernet.payload()) {
         let vid = vlan.get_vlan_identifier();
         if cfg.vlans.contains_key(&vid) {
             match vlan.get_ethertype() {
                 EtherTypes::Ipv4 => {
-                    stats.ipv4.rx_pkts += 1;
-                    handle_ipv4_packet(interface_name, vlan.payload(), &cfg.vlans[&vid], stats);
+                    chan.stats.ipv4.rx_pkts += 1;
+                    handle_ipv4_packet(vlan.payload(), &cfg.vlans[&vid], chan);
                 },
                 EtherTypes::Ipv6 => {
-                    stats.ipv6.rx_pkts += 1;
-                    handle_ipv6_packet(interface_name, vlan.payload(), &cfg.vlans[&vid], stats);
+                    chan.stats.ipv6.rx_pkts += 1;
+                    handle_ipv6_packet(vlan.payload(), &cfg.vlans[&vid], chan);
                 },
                 EtherTypes::Arp => {
-                    stats.arp.rx_pkts += 1;
-                    handle_arp_packet(interface_name, ethernet, &cfg.vlans[&vid], stats);
+                    chan.stats.arp.rx_pkts += 1;
+                    handle_arp_packet(ethernet, &cfg.vlans[&vid], chan);
                 },
-                _ => stats.rx_pkts_dropped_unsupported += 1
+                _ => chan.stats.rx_pkts_dropped_unsupported += 1
             }
         } else {
-            stats.vlan.rx_pkts_dropped_not_for_us += 1;
+            chan.stats.vlan.rx_pkts_dropped_not_for_us += 1;
         }
     } else {
-        stats.vlan.rx_pkts_dropped_malformed += 1;
+        chan.stats.vlan.rx_pkts_dropped_malformed += 1;
     }
 
 }
 
-fn handle_arp_packet(interface_name: &str, ethernet: &EthernetPacket, cfg: &CfgIp, stats: &mut Stats) {
+fn handle_arp_packet(ethernet: &EthernetPacket, cfg: &CfgIp, chan: &mut Chan) {
     if let Some(header) = ArpPacket::new(ethernet.payload()) {
         let dip = header.get_target_proto_addr();
         match cfg.ip {
             IpNetwork::V4(net)if net.ip() == dip => {
-                unimplemented!()
+                match header.get_operation() {
+                    ArpOperations::Request => {
+                        chan.stats.arp.rx_pkts_request += 1;
+                        send_arp_reply(&header, dip, chan);
+                        chan.stats.arp.tx_pkts_reply += 1;
+                    },
+                    ArpOperations::Reply => {
+                        chan.stats.arp.rx_pkts_reply += 1;
+                    },
+                    _ => chan.stats.arp.rx_pkts_dropped_unsupported += 1,
+                }
             },
-            _ => stats.arp.rx_pkts_dropped_not_for_us += 1
+            _ => chan.stats.arp.rx_pkts_dropped_not_for_us += 1
         }
-        println!(
-            "[{}]: ARP packet: {}({}) > {}({}); operation: {:?}",
-            interface_name,
-            ethernet.get_source(),
-            header.get_sender_proto_addr(),
-            ethernet.get_destination(),
-            header.get_target_proto_addr(),
-            header.get_operation()
-        );
     } else {
-        stats.arp.rx_pkts_dropped_malformed += 1
+        chan.stats.arp.rx_pkts_dropped_malformed += 1
     }
 }
 
-fn handle_ipv4_packet(interface_name: &str, packet: &[u8], cfg: &CfgIp, stats: &mut Stats) {
+// send the reply to an arp request
+fn send_arp_reply(arp_req: &ArpPacket, source_ip: Ipv4Addr, chan: &mut Chan) {
+    let mut ethernet_buffer = [0u8; 42];
+    let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+
+    ethernet_packet.set_destination(arp_req. get_sender_hw_addr());
+    ethernet_packet.set_source(chan.interface.mac_address());
+    ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+    let mut arp_buffer = [0u8; 28];
+    let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
+
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+    arp_packet.set_operation(ArpOperations::Reply);
+    arp_packet.set_sender_hw_addr(chan.interface.mac_address());
+    arp_packet.set_sender_proto_addr(source_ip);
+    arp_packet.set_target_hw_addr(arp_req.get_sender_hw_addr());
+    arp_packet.set_target_proto_addr(arp_req.get_sender_proto_addr());
+
+    ethernet_packet.set_payload(arp_packet.packet_mut());
+
+    chan.tx.send_to(ethernet_packet.packet(), None)
+        .unwrap()
+        .unwrap();
+}
+
+fn send_arp_request(source_ip: Ipv4Addr, target_ip: Ipv4Addr, chan: &mut Chan) {
+
+    let mut ethernet_buffer = [0u8; 42];
+    let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+
+    ethernet_packet.set_destination(MacAddr::broadcast());
+    ethernet_packet.set_source(chan.interface.mac_address());
+    ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+    let mut arp_buffer = [0u8; 28];
+    let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
+
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+    arp_packet.set_operation(ArpOperations::Request);
+    arp_packet.set_sender_hw_addr(chan.interface.mac_address());
+    arp_packet.set_sender_proto_addr(source_ip);
+    arp_packet.set_target_hw_addr(MacAddr::zero());
+    arp_packet.set_target_proto_addr(target_ip);
+
+    ethernet_packet.set_payload(arp_packet.packet_mut());
+
+    chan.tx.send_to(ethernet_packet.packet(), None)
+        .unwrap()
+        .unwrap();
+}
+
+fn handle_ipv4_packet(packet: &[u8], cfg: &CfgIp, chan: &mut Chan) {
     if let Some(header) = Ipv4Packet::new(packet) {
         // accept packets to both the linknet ip and the svc ip
         let dip = header.get_destination();
         match (cfg.ip, cfg.svc) {
             (IpNetwork::V4(net), SocketAddr::V4(svc)) if net.ip() == dip || svc.ip() == &dip => {
-                unimplemented!()
+                handle_transport_protocol(
+                    IpAddr::V4(header.get_source()),
+                    IpAddr::V4(header.get_destination()),
+                    header.get_next_level_protocol(),
+                    header.payload(),
+                    chan
+                );
             },
-            _ => stats.ipv4.rx_pkts_dropped_not_for_us += 1
+            _ => chan.stats.ipv4.rx_pkts_dropped_not_for_us += 1
         }
-        handle_transport_protocol(
-            interface_name,
-            IpAddr::V4(header.get_source()),
-            IpAddr::V4(header.get_destination()),
-            header.get_next_level_protocol(),
-            header.payload(),
-            stats
-        );
     } else {
-        stats.ipv4.rx_pkts_dropped_malformed += 1
+        chan.stats.ipv4.rx_pkts_dropped_malformed += 1
     }
 }
 
-fn handle_ipv6_packet(interface_name: &str, packet: &[u8], cfg: &CfgIp, stats: &mut Stats) {
+fn handle_ipv6_packet(packet: &[u8], cfg: &CfgIp, chan: &mut Chan) {
     if let Some(header) = Ipv6Packet::new(packet) {
         // accept packets to both the linknet ip and the svc ip
         let dip = header.get_destination();
         match (cfg.ip, cfg.svc) {
             (IpNetwork::V6(net), SocketAddr::V6(svc)) if net.ip() == dip || svc.ip() == &dip => {
-                unimplemented!()
+                handle_transport_protocol(
+                    IpAddr::V6(header.get_source()),
+                    IpAddr::V6(header.get_destination()),
+                    header.get_next_header(),
+                    header.payload(),
+                    chan
+                );
             },
-            _ => stats.ipv6.rx_pkts_dropped_not_for_us += 1
+            _ => chan.stats.ipv6.rx_pkts_dropped_not_for_us += 1
         }
-        handle_transport_protocol(
-            interface_name,
-            IpAddr::V6(header.get_source()),
-            IpAddr::V6(header.get_destination()),
-            header.get_next_header(),
-            header.payload(),
-            stats
-        );
     } else {
-        stats.ipv6.rx_pkts_dropped_malformed += 1
+        chan.stats.ipv6.rx_pkts_dropped_malformed += 1
     }
 }
 
-fn handle_udp_packet(interface_name: &str, source: IpAddr, destination: IpAddr, packet: &[u8], stats: &mut Stats) {
+fn handle_transport_protocol(
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: IpNextHeaderProtocol,
+    packet: &[u8],
+    chan: &mut Chan
+) {
+    match protocol {
+        IpNextHeaderProtocols::Udp => {
+            handle_udp_packet(source, destination, packet, chan)
+        }
+        IpNextHeaderProtocols::Tcp => {
+            handle_tcp_packet(source, destination, packet, chan)
+        }
+        IpNextHeaderProtocols::Icmp => {
+            handle_icmp_packet(source, destination, packet, chan)
+        }
+        IpNextHeaderProtocols::Icmpv6 => {
+            handle_icmpv6_packet(source, destination, packet, chan)
+        }
+        _ => chan.stats.rx_pkts_dropped_unsupported += 1
+    }
+}
+
+fn handle_udp_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
     let udp = UdpPacket::new(packet);
 
     if let Some(udp) = udp {
         println!(
             "[{}]: UDP Packet: {}:{} > {}:{}; length: {}",
-            interface_name,
+            chan.interface.name,
             source,
             udp.get_source(),
             destination,
@@ -306,11 +405,11 @@ fn handle_udp_packet(interface_name: &str, source: IpAddr, destination: IpAddr, 
             udp.get_length()
         );
     } else {
-        stats.rx_pkts_dropped_unsupported += 1
+        chan.stats.rx_pkts_dropped_unsupported += 1
     }
 }
 
-fn handle_icmp_packet(interface_name: &str, source: IpAddr, destination: IpAddr, packet: &[u8], stats: &mut Stats) {
+fn handle_icmp_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
     let icmp_packet = IcmpPacket::new(packet);
     if let Some(icmp_packet) = icmp_packet {
         match icmp_packet.get_icmp_type() {
@@ -318,7 +417,7 @@ fn handle_icmp_packet(interface_name: &str, source: IpAddr, destination: IpAddr,
                 let echo_reply_packet = echo_reply::EchoReplyPacket::new(packet).unwrap();
                 println!(
                     "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
-                    interface_name,
+                    chan.interface.name,
                     source,
                     destination,
                     echo_reply_packet.get_sequence_number(),
@@ -329,7 +428,7 @@ fn handle_icmp_packet(interface_name: &str, source: IpAddr, destination: IpAddr,
                 let echo_request_packet = echo_request::EchoRequestPacket::new(packet).unwrap();
                 println!(
                     "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
-                    interface_name,
+                    chan.interface.name,
                     source,
                     destination,
                     echo_request_packet.get_sequence_number(),
@@ -338,38 +437,38 @@ fn handle_icmp_packet(interface_name: &str, source: IpAddr, destination: IpAddr,
             }
             _ => println!(
                 "[{}]: ICMP packet {} -> {} (type={:?})",
-                interface_name,
+                chan.interface.name,
                 source,
                 destination,
                 icmp_packet.get_icmp_type()
             ),
         }
     } else {
-        stats.rx_pkts_dropped_unsupported += 1
+        chan.stats.rx_pkts_dropped_unsupported += 1
     }
 }
 
-fn handle_icmpv6_packet(interface_name: &str, source: IpAddr, destination: IpAddr, packet: &[u8], stats: &mut Stats) {
+fn handle_icmpv6_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
     let icmpv6_packet = Icmpv6Packet::new(packet);
     if let Some(icmpv6_packet) = icmpv6_packet {
         println!(
             "[{}]: ICMPv6 packet {} -> {} (type={:?})",
-            interface_name,
+            chan.interface.name,
             source,
             destination,
             icmpv6_packet.get_icmpv6_type()
         )
     } else {
-        stats.rx_pkts_dropped_unsupported += 1
+        chan.stats.rx_pkts_dropped_unsupported += 1
     }
 }
 
-fn handle_tcp_packet(interface_name: &str, source: IpAddr, destination: IpAddr, packet: &[u8], stats: &mut Stats) {
+fn handle_tcp_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
     let tcp = TcpPacket::new(packet);
     if let Some(tcp) = tcp {
         println!(
             "[{}]: TCP Packet: {}:{} > {}:{}; length: {}",
-            interface_name,
+            chan.interface.name,
             source,
             tcp.get_source(),
             destination,
@@ -377,34 +476,10 @@ fn handle_tcp_packet(interface_name: &str, source: IpAddr, destination: IpAddr, 
             packet.len()
         );
     } else {
-        stats.rx_pkts_dropped_unsupported += 1
+        chan.stats.rx_pkts_dropped_unsupported += 1
     }
 }
 
-fn handle_transport_protocol(
-    interface_name: &str,
-    source: IpAddr,
-    destination: IpAddr,
-    protocol: IpNextHeaderProtocol,
-    packet: &[u8],
-    stats: &mut Stats
-) {
-    match protocol {
-        IpNextHeaderProtocols::Udp => {
-            handle_udp_packet(interface_name, source, destination, packet, stats)
-        }
-        IpNextHeaderProtocols::Tcp => {
-            handle_tcp_packet(interface_name, source, destination, packet, stats)
-        }
-        IpNextHeaderProtocols::Icmp => {
-            handle_icmp_packet(interface_name, source, destination, packet, stats)
-        }
-        IpNextHeaderProtocols::Icmpv6 => {
-            handle_icmpv6_packet(interface_name, source, destination, packet, stats)
-        }
-        _ => stats.rx_pkts_dropped_unsupported += 1
-    }
-}
 
 
 

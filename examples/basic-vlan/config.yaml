@@ -1,0 +1,7 @@
+interfaces:
+  usnetbasicvl:
+    vlans:
+      10:
+        ip:  10.1.1.2/29
+        gw:  10.1.1.1
+        svc: 10.1.100.0:10000

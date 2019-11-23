@@ -1,5 +1,5 @@
 [package]
-name = "raw-sockets-playground"
+name = "usnet"
 version = "0.1.0"
 authors = ["Maximilian Hristache <mhristache@gmail.com>"]
 edition = "2018"

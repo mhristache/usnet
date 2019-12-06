@@ -21,3 +21,6 @@ ip link add link usnetadvr usnetadvr.20 type vlan id 20
 ip link set usnetadvr.20 up
 ip addr add 10.20.1.1/29 dev usnetadvr.20
 
+ip route add 10.10.100.1 via 10.10.1.2
+ip route add 10.20.100.1 via 10.20.1.2
+ip route add 10.30.100.1 via 10.30.1.2

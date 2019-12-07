@@ -13,4 +13,4 @@ ip link add link usnetbasicvr usnetbasicvr.10 type vlan id 10
 ip link set usnetbasicvr.10 up
 ip addr add 10.1.1.1/29 dev usnetbasicvr.10
 
-ip route add 10.1.100.1 via 10.0.10.2
+ip route add 10.1.100.1 via 10.1.1.2

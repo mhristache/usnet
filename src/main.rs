@@ -5,7 +5,7 @@ use pnet::datalink::DataLinkSender;
 use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::arp::*;
 use pnet::packet::ethernet::{EtherType, EtherTypes, EthernetPacket, MutableEthernetPacket};
-use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
+use pnet::packet::icmp::{self, echo_reply, echo_request, IcmpPacket, IcmpTypes};
 use pnet::packet::icmpv6::Icmpv6Packet;
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
@@ -18,7 +18,7 @@ use pnet::util::MacAddr;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::thread;
 use std::time;
 
@@ -51,6 +51,7 @@ struct Stats {
     rx_pkts: u64,
     tx_pkts: u64,
     rx_pkts_dropped_unsupported: u64,
+    rx_pkts_dropped_malformed: u64,
     vlan: VlanStats,
     arp: ArpStats,
     ipv4: PktStats,
@@ -96,13 +97,11 @@ struct ArpStats {
 #[derive(Debug, Default)]
 struct IcmpStats {
     rx_pkts: u64,
-    tx_pkts: u64,
     rx_pkts_request: u64,
     rx_pkts_reply: u64,
-    tx_pkts_reply: u64,
-    tx_pkts_request: u64,
     rx_pkts_dropped_malformed: u64,
     rx_pkts_dropped_unsupported: u64,
+    tx_pkts_reply: u64,
 }
 
 #[derive(Debug, Default)]
@@ -524,8 +523,18 @@ fn handle_transport_protocol(
     match protocol {
         IpNextHeaderProtocols::Udp => handle_udp_packet(source, destination, packet, svc, chan),
         IpNextHeaderProtocols::Tcp => handle_tcp_packet(source, destination, packet, chan),
-        IpNextHeaderProtocols::Icmp => handle_icmp_packet(source, destination, packet, chan),
-        IpNextHeaderProtocols::Icmpv6 => handle_icmpv6_packet(source, destination, packet, chan),
+        IpNextHeaderProtocols::Icmp => match (source, destination) {
+            (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                handle_icmp_packet(source, destination, packet, chan)
+            }
+            _ => chan.stats.rx_pkts_dropped_malformed += 1,
+        },
+        IpNextHeaderProtocols::Icmpv6 => match (source, destination) {
+            (IpAddr::V6(source), IpAddr::V6(destination)) => {
+                handle_icmpv6_packet(source, destination, packet, chan)
+            }
+            _ => chan.stats.rx_pkts_dropped_malformed += 1,
+        },
         _ => chan.stats.rx_pkts_dropped_unsupported += 1,
     }
 }
@@ -561,6 +570,14 @@ fn handle_udp_packet(
             // TODO: add checksum
             match (source, destination) {
                 (IpAddr::V4(s), IpAddr::V4(d)) => {
+                    send_ipv4_packet(
+                        d,
+                        s,
+                        IpNextHeaderProtocols::Udp,
+                        udp_packet.packet_mut(),
+                        None,
+                        chan,
+                    );
                     debug!(
                         "[{}]: UDP Packet sent: {}:{} > {}:{}; length: {}",
                         chan.interface.name,
@@ -570,14 +587,7 @@ fn handle_udp_packet(
                         udp_packet.get_destination(),
                         udp_packet.get_length()
                     );
-                    send_ipv4_packet(
-                        d,
-                        s,
-                        IpNextHeaderProtocols::Udp,
-                        udp_packet.packet_mut(),
-                        None,
-                        chan,
-                    );
+                    chan.stats.udp.tx_pkts += 1;
                 }
                 _ => unimplemented!(),
             }
@@ -589,36 +599,52 @@ fn handle_udp_packet(
     }
 }
 
-fn handle_icmp_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
+fn handle_icmp_packet(source: Ipv4Addr, destination: Ipv4Addr, packet: &[u8], chan: &mut Chan) {
     chan.stats.icmp4.rx_pkts += 1;
     if let Some(icmp_packet) = IcmpPacket::new(packet) {
         match icmp_packet.get_icmp_type() {
             IcmpTypes::EchoReply => {
-                let echo_reply_packet = echo_reply::EchoReplyPacket::new(packet).unwrap();
                 chan.stats.icmp4.rx_pkts_reply += 1;
-                debug!(
-                    "[{}]: ICMP echo reply {} -> {} (seq={:?}, id={:?})",
-                    chan.interface.name,
-                    source,
-                    destination,
-                    echo_reply_packet.get_sequence_number(),
-                    echo_reply_packet.get_identifier()
-                );
             }
             IcmpTypes::EchoRequest => {
-                let echo_request_packet = echo_request::EchoRequestPacket::new(packet).unwrap();
                 chan.stats.icmp4.rx_pkts_request += 1;
+                let echo_request_packet = echo_request::EchoRequestPacket::new(packet).unwrap();
                 debug!(
                     "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
                     chan.interface.name,
                     source,
                     destination,
                     echo_request_packet.get_sequence_number(),
-                    echo_request_packet.get_identifier()
+                    echo_request_packet.get_identifier(),
                 );
+
+                // build a reply packet using the request as base
+                let mut echo_reply_packet =
+                    echo_reply::MutableEchoReplyPacket::owned(packet.to_vec()).unwrap();
+                echo_reply_packet.set_icmp_type(IcmpTypes::EchoReply);
+                let icmp_packet = IcmpPacket::new(echo_reply_packet.packet()).unwrap();
+                let checksum = icmp::checksum(&icmp_packet);
+                echo_reply_packet.set_checksum(checksum);
+                send_ipv4_packet(
+                    destination,
+                    source,
+                    IpNextHeaderProtocols::Icmp,
+                    echo_reply_packet.packet(),
+                    None,
+                    chan,
+                );
+                debug!(
+                    "[{}]: ICMP echo reply   {} -> {} (seq={:?}, id={:?})",
+                    chan.interface.name,
+                    destination,
+                    source,
+                    echo_request_packet.get_sequence_number(),
+                    echo_request_packet.get_identifier(),
+                );
+                chan.stats.icmp4.tx_pkts_reply += 1;
             }
             _ => debug!(
-                "[{}]: ICMP packet {} -> {} (type={:?})",
+                "[{}]: ICMP packet received {} -> {} (type={:?})",
                 chan.interface.name,
                 source,
                 destination,
@@ -630,7 +656,7 @@ fn handle_icmp_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: 
     }
 }
 
-fn handle_icmpv6_packet(source: IpAddr, destination: IpAddr, packet: &[u8], chan: &mut Chan) {
+fn handle_icmpv6_packet(source: Ipv6Addr, destination: Ipv6Addr, packet: &[u8], chan: &mut Chan) {
     let icmpv6_packet = Icmpv6Packet::new(packet);
     if let Some(icmpv6_packet) = icmpv6_packet {
         debug!(

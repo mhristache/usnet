@@ -128,12 +128,15 @@ struct Chan {
 fn main() {
     env_logger::init();
     let cfg: Config = match std::env::args().nth(1) {
-        Some(p) => match std::fs::read_to_string(p) {
-            Ok(s) => match serde_yaml::from_str(&s) {
-                Ok(c) => c,
-                Err(e) => panic!("failed to parse the config: {}", e),
-            },
-            Err(e) => panic!("failed to open the config: {}", e),
+        Some(p) => {
+            debug!("opening file {}", p);
+            match std::fs::read_to_string(p) {
+                Ok(s) => match serde_yaml::from_str(&s) {
+                    Ok(c) => c,
+                    Err(e) => panic!("failed to parse the config: {}", e),
+                },
+                Err(e) => panic!("failed to open the config: {}", e),
+            }
         },
         None => {
             writeln!(
@@ -176,7 +179,6 @@ fn handle_ethernet_channel(intf: NetworkInterface, cfg: CfgIntf) {
         Err(e) => panic!("unable to create channel: {}", e),
     };
 
-    // TODO: redesign this logic to retrieve the neighbors in an on demand manner
     // preemptively update the neighbors table for all configured gateways
     let neighbors = HashMap::new();
     let mut chan = Chan {
@@ -245,6 +247,7 @@ fn get_neighbor(vlan_id: Option<u16>, ip: IpAddr, chan: &mut Chan) -> Option<Mac
 }
 
 fn handle_ethernet_frame(ethernet: &EthernetPacket, cfg: &CfgIntf, chan: &mut Chan) {
+    trace!("received packet dump: {:02x?}", ethernet.packet());
     match ethernet.get_ethertype() {
         EtherTypes::Ipv4 => {
             chan.stats.ipv4.rx_pkts += 1;

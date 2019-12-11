@@ -137,14 +137,9 @@ fn main() {
                 },
                 Err(e) => panic!("failed to open the config: {}", e),
             }
-        },
+        }
         None => {
-            writeln!(
-                std::io::stderr(),
-                "{}",
-                "Usage: raw-sockets-playground <config>\n"
-            )
-            .unwrap();
+            writeln!(std::io::stderr(), "{}", "Usage: usnet <config>\n").unwrap();
             std::process::exit(1);
         }
     };
@@ -172,9 +167,11 @@ fn main() {
 fn handle_ethernet_channel(intf: NetworkInterface, cfg: CfgIntf) {
     info!("opening an ethernet channel on interface '{}'", intf.name);
 
+    let mut ring = af_packet::rx::Ring::from_if_name(&intf.name).unwrap();
+
     // Create an ethernet channel to send and receive on
-    let (tx, mut rx) = match datalink::channel(&intf, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
+    let tx = match datalink::channel(&intf, Default::default()) {
+        Ok(Ethernet(tx, _)) => tx,
         Ok(_) => panic!("unsupported channel type: {}"),
         Err(e) => panic!("unable to create channel: {}", e),
     };
@@ -208,16 +205,18 @@ fn handle_ethernet_channel(intf: NetworkInterface, cfg: CfgIntf) {
     }
 
     loop {
-        match rx.next() {
-            Ok(packet) => {
-                chan.stats.rx_pkts += 1;
-                handle_ethernet_frame(&EthernetPacket::new(packet).unwrap(), &cfg, &mut chan);
+        let mut block = ring.get_block(); //THIS WILL BLOCK
+        for packet in block.get_raw_packets() {
+            // tpacket3_hdr is described here:
+            // http://www.microhowto.info/howto/capture_ethernet_frames_using_an_af_packet_ring_buffer_in_c.html
+            let pkt_start = packet.tpacket3_hdr.tp_mac as usize;
+            let pkt_end = packet.tpacket3_hdr.tp_mac as usize + packet.tpacket3_hdr.tp_len as usize;
+            match EthernetPacket::new(&packet.data[pkt_start..pkt_end]) {
+                Some(eth) => handle_ethernet_frame(&eth, &cfg, &mut chan),
+                None => chan.stats.rx_pkts_dropped_malformed += 1
             }
-            Err(e) => panic!(
-                "unable to receive packets on interface {}: {}",
-                chan.interface.name, e
-            ),
         }
+        block.mark_as_consumed();
         trace!("[{}] - stats:\n{:#?}", chan.interface.name, chan.stats);
     }
 }
@@ -275,7 +274,7 @@ fn handle_ethernet_frame(ethernet: &EthernetPacket, cfg: &CfgIntf, chan: &mut Ch
             chan.stats.arp.rx_pkts += 1;
             match cfg {
                 CfgIntf::Untagged(ip) => {
-                    handle_arp_packet(ethernet.payload(),ip, None, chan);
+                    handle_arp_packet(ethernet.payload(), ip, None, chan);
                 }
                 CfgIntf::Tagged(_) => {
                     chan.stats.arp.rx_pkts_dropped_no_vlan += 1;
@@ -527,7 +526,9 @@ fn handle_transport_protocol(
     chan: &mut Chan,
 ) {
     match protocol {
-        IpNextHeaderProtocols::Udp => handle_udp_packet(source, destination, packet, svc, vlan_id, chan),
+        IpNextHeaderProtocols::Udp => {
+            handle_udp_packet(source, destination, packet, svc, vlan_id, chan)
+        }
         IpNextHeaderProtocols::Tcp => handle_tcp_packet(source, destination, packet, chan),
         IpNextHeaderProtocols::Icmp => match (source, destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -606,7 +607,13 @@ fn handle_udp_packet(
     }
 }
 
-fn handle_icmp_packet(source: Ipv4Addr, destination: Ipv4Addr, packet: &[u8], vlan_id: Option<u16>, chan: &mut Chan) {
+fn handle_icmp_packet(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    packet: &[u8],
+    vlan_id: Option<u16>,
+    chan: &mut Chan,
+) {
     chan.stats.icmp4.rx_pkts += 1;
     if let Some(icmp_packet) = IcmpPacket::new(packet) {
         match icmp_packet.get_icmp_type() {

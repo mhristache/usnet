@@ -1,6 +1,6 @@
-interfaces:
+interface:
   eth0:
-    vlans:
+    vlan:
       10:
         ip:  10.1.1.2/29
         gw:  10.1.1.1

@@ -12,7 +12,7 @@ use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
-use pnet::packet::vlan::{ClassOfService, MutableVlanPacket, VlanPacket};
+use pnet::packet::vlan::{ClassOfService, MutableVlanPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use serde::Deserialize;
@@ -23,20 +23,13 @@ use std::thread;
 use std::time;
 
 #[derive(Debug, Deserialize)]
-struct Config {
-    interfaces: HashMap<String, CfgIntf>,
+struct Cfg {
+    interface: HashMap<String, CfgIntf>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum CfgIntf {
-    Untagged(CfgIp),
-    Tagged(CfgVlans),
-}
-
-#[derive(Debug, Deserialize)]
-struct CfgVlans {
-    vlans: HashMap<u16, CfgIp>,
+struct CfgIntf {
+    vlan: HashMap<u16, CfgIp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,11 +41,12 @@ struct CfgIp {
 
 #[derive(Debug, Default)]
 struct Stats {
-    rx_pkts: u64,
-    tx_pkts: u64,
-    rx_pkts_dropped_unsupported: u64,
-    rx_pkts_dropped_malformed: u64,
-    vlan: VlanStats,
+    rx_pkts: u32,
+    rx_bytes: u64,
+    tx_pkts: u32,
+    rx_pkts_dropped_unsupported: u32,
+    rx_pkts_dropped_malformed: u32,
+    rx_pkts_dropped_not_for_us: u32,
     arp: ArpStats,
     ipv4: PktStats,
     ipv6: PktStats,
@@ -62,72 +56,58 @@ struct Stats {
 
 #[derive(Debug, Default)]
 struct PktStats {
-    rx_pkts: u64,
-    tx_pkts: u64,
-    rx_pkts_accepted: u64,
-    rx_pkts_dropped_not_for_us: u64,
-    rx_pkts_dropped_malformed: u64,
-    rx_pkts_dropped_no_vlan: u64,
-}
-
-#[derive(Debug, Default)]
-struct VlanStats {
-    rx_pkts: u64,
-    tx_pkts: u64,
-    rx_pkts_accepted: u64,
-    rx_pkts_dropped_not_for_us: u64,
-    rx_pkts_dropped_has_vlan: u64,
-    rx_pkts_dropped_malformed: u64,
+    rx_pkts: u32,
+    tx_pkts: u32,
+    rx_pkts_dropped_not_for_us: u32,
+    rx_pkts_dropped_malformed: u32,
 }
 
 #[derive(Debug, Default)]
 struct ArpStats {
-    rx_pkts: u64,
-    rx_pkts_request: u64,
-    rx_pkts_reply: u64,
-    rx_pkts_dropped_not_for_us: u64,
-    rx_pkts_dropped_has_vlan: u64,
-    rx_pkts_dropped_malformed: u64,
-    rx_pkts_dropped_no_vlan: u64,
-    rx_pkts_dropped_unsupported: u64,
-    tx_pkts_reply: u64,
-    tx_pkts_request: u64,
+    rx_pkts: u32,
+    rx_pkts_request: u32,
+    rx_pkts_reply: u32,
+    rx_pkts_dropped_malformed: u32,
+    rx_pkts_dropped_unsupported: u32,
+    rx_pkts_dropped_not_for_us: u32,
+    tx_pkts_reply: u32,
+    tx_pkts_request: u32,
 }
 
 #[derive(Debug, Default)]
 struct IcmpStats {
-    rx_pkts: u64,
-    rx_pkts_request: u64,
-    rx_pkts_reply: u64,
-    rx_pkts_dropped_malformed: u64,
-    rx_pkts_dropped_unsupported: u64,
-    tx_pkts_reply: u64,
+    rx_pkts: u32,
+    rx_pkts_request: u32,
+    rx_pkts_reply: u32,
+    rx_pkts_dropped_malformed: u32,
+    rx_pkts_dropped_unsupported: u32,
+    tx_pkts_reply: u32,
 }
 
 #[derive(Debug, Default)]
 struct UdpStats {
-    rx_pkts: u64,
-    tx_pkts: u64,
-    rx_pkts_dropped_not_for_us: u64,
-    rx_pkts_dropped_unsupported: u64,
+    rx_pkts: u32,
+    tx_pkts: u32,
+    rx_pkts_dropped_not_for_us: u32,
+    rx_pkts_dropped_malformed: u32,
 }
 
 #[derive(Debug, Default)]
 struct SvcStats {
-    rx_pkts: u64,
-    tx_pkts: u64,
+    rx_pkts: u32,
+    tx_pkts: u32,
 }
 
 struct Chan {
     stats: Stats,
     tx: Box<dyn DataLinkSender>,
     interface: NetworkInterface,
-    neighbors: HashMap<(Option<u16>, IpAddr), (MacAddr, time::Instant)>,
+    neighbors: HashMap<(u16, IpAddr), (MacAddr, time::Instant)>,
 }
 
 fn main() {
     env_logger::init();
-    let cfg: Config = match std::env::args().nth(1) {
+    let cfg: Cfg = match std::env::args().nth(1) {
         Some(p) => {
             debug!("opening file {}", p);
             match std::fs::read_to_string(p) {
@@ -147,10 +127,10 @@ fn main() {
 
     // get all the available network interfaces
     let intfs = datalink::interfaces();
-    trace!("interfaces:\n{:#?}", intfs);
+    trace!("available host interfaces:\n{:#?}", intfs);
 
-    let mut channel_threads = Vec::with_capacity(cfg.interfaces.len());
-    for (cfg_intf_name, cfg_intf) in cfg.interfaces {
+    let mut channel_threads = Vec::with_capacity(cfg.interface.len());
+    for (cfg_intf_name, cfg_intf) in cfg.interface {
         // find the pnet interface for the configured interface name
         let intf = match intfs.iter().find(|i| i.name == cfg_intf_name) {
             Some(i) => i.clone(),
@@ -185,35 +165,42 @@ fn handle_ethernet_channel(intf: NetworkInterface, cfg: CfgIntf) {
         neighbors,
     };
 
-    match cfg {
-        CfgIntf::Untagged(ref c) => match (c.ip.ip(), c.gw) {
+    for (vid, ip_cfg) in cfg.vlan.iter() {
+        match (ip_cfg.ip.ip(), ip_cfg.gw) {
             (IpAddr::V4(own_ip), IpAddr::V4(gw_ip)) => {
-                send_arp_request(own_ip, gw_ip, None, &mut chan)
+                send_arp_request(own_ip, gw_ip, *vid, &mut chan)
             }
             _ => unimplemented!(),
-        },
-        CfgIntf::Tagged(ref c) => {
-            for (vid, ip_cfg) in c.vlans.iter() {
-                match (ip_cfg.ip.ip(), ip_cfg.gw) {
-                    (IpAddr::V4(own_ip), IpAddr::V4(gw_ip)) => {
-                        send_arp_request(own_ip, gw_ip, Some(*vid), &mut chan)
-                    }
-                    _ => unimplemented!(),
-                }
-            }
         }
     }
 
+    // the vlan id is the last 12 bits in vlan_tci
+    let vid_mask = (1 << 12) - 1;
+
     loop {
-        let mut block = ring.get_block(); //THIS WILL BLOCK
+        let mut block = ring.get_block(); // this will block
         for packet in block.get_raw_packets() {
+            chan.stats.rx_pkts += 1;
+            chan.stats.rx_bytes += packet.tpacket3_hdr.tp_len as u64;
+
             // tpacket3_hdr is described here:
             // http://www.microhowto.info/howto/capture_ethernet_frames_using_an_af_packet_ring_buffer_in_c.html
-            let pkt_start = packet.tpacket3_hdr.tp_mac as usize;
-            let pkt_end = packet.tpacket3_hdr.tp_mac as usize + packet.tpacket3_hdr.tp_len as usize;
-            match EthernetPacket::new(&packet.data[pkt_start..pkt_end]) {
-                Some(eth) => handle_ethernet_frame(&eth, &cfg, &mut chan),
-                None => chan.stats.rx_pkts_dropped_malformed += 1
+            let vid = (packet.tpacket3_hdr.hv1.tp_vlan_tci & vid_mask) as u16;
+
+            match cfg.vlan.get(&vid) {
+                Some(ip_cfg) => {
+                    let pkt_start = packet.tpacket3_hdr.tp_mac as usize;
+                    let pkt_end =
+                        packet.tpacket3_hdr.tp_mac as usize + packet.tpacket3_hdr.tp_len as usize;
+                    match EthernetPacket::new(&packet.data[pkt_start..pkt_end]) {
+                        Some(eth) => handle_ethernet_frame(&eth, &ip_cfg, vid, &mut chan),
+                        None => chan.stats.rx_pkts_dropped_malformed += 1,
+                    }
+                }
+                None => {
+                    chan.stats.rx_pkts_dropped_not_for_us += 1;
+                    continue;
+                }
             }
         }
         block.mark_as_consumed();
@@ -232,65 +219,38 @@ fn send_packet(chan: &mut Chan, packet: &[u8]) {
     chan.stats.tx_pkts += 1;
 }
 
-fn add_neighbor(vlan_id: Option<u16>, ip: IpAddr, mac: MacAddr, chan: &mut Chan) {
+fn add_neighbor(vlan_id: u16, ip: IpAddr, mac: MacAddr, chan: &mut Chan) {
     chan.neighbors
         .insert((vlan_id, ip), (mac, time::Instant::now()));
     debug!(
-        "[{}]: neighbors table updated for vlan {:?} with {} -> {}",
+        "[{}.{}]: neighbors table updated with {} -> {}",
         chan.interface.name, vlan_id, ip, mac
     );
 }
 
-fn get_neighbor(vlan_id: Option<u16>, ip: IpAddr, chan: &mut Chan) -> Option<MacAddr> {
+fn get_neighbor(vlan_id: u16, ip: IpAddr, chan: &mut Chan) -> Option<MacAddr> {
     chan.neighbors.get(&(vlan_id, ip)).map(|a| a.0)
 }
 
-fn handle_ethernet_frame(ethernet: &EthernetPacket, cfg: &CfgIntf, chan: &mut Chan) {
-    trace!("received packet dump: {:02x?}", ethernet.packet());
+fn handle_ethernet_frame(ethernet: &EthernetPacket, cfg_ip: &CfgIp, vlan_id: u16, chan: &mut Chan) {
+    trace!(
+        "[{}.{}]: packet received: {:02x?}",
+        &chan.interface.name,
+        vlan_id,
+        ethernet.packet()
+    );
     match ethernet.get_ethertype() {
         EtherTypes::Ipv4 => {
             chan.stats.ipv4.rx_pkts += 1;
-            match cfg {
-                CfgIntf::Untagged(ip) => {
-                    handle_ipv4_packet(ethernet.payload(), ip, None, chan);
-                }
-                CfgIntf::Tagged(_) => {
-                    chan.stats.ipv4.rx_pkts_dropped_no_vlan += 1;
-                }
-            }
+            handle_ipv4_packet(ethernet.payload(), cfg_ip, vlan_id, chan);
         }
         EtherTypes::Ipv6 => {
             chan.stats.ipv6.rx_pkts += 1;
-            match cfg {
-                CfgIntf::Untagged(ip) => {
-                    handle_ipv6_packet(ethernet.payload(), ip, None, chan);
-                }
-                CfgIntf::Tagged(_) => {
-                    chan.stats.ipv6.rx_pkts_dropped_no_vlan += 1;
-                }
-            }
+            handle_ipv6_packet(ethernet.payload(), cfg_ip, vlan_id, chan);
         }
         EtherTypes::Arp => {
             chan.stats.arp.rx_pkts += 1;
-            match cfg {
-                CfgIntf::Untagged(ip) => {
-                    handle_arp_packet(ethernet.payload(), ip, None, chan);
-                }
-                CfgIntf::Tagged(_) => {
-                    chan.stats.arp.rx_pkts_dropped_no_vlan += 1;
-                }
-            }
-        }
-        EtherTypes::Vlan => {
-            chan.stats.vlan.rx_pkts += 1;
-            match cfg {
-                CfgIntf::Untagged(_) => {
-                    chan.stats.vlan.rx_pkts_dropped_has_vlan += 1;
-                }
-                CfgIntf::Tagged(vlans) => {
-                    handle_vlan_packet(ethernet, vlans, chan);
-                }
-            }
+            handle_arp_packet(ethernet.payload(), cfg_ip, vlan_id, chan);
         }
         _ => chan.stats.rx_pkts_dropped_unsupported += 1,
     }
@@ -306,43 +266,16 @@ fn send_ethernet_packet(dest_mac: MacAddr, ethertype: EtherType, payload: &[u8],
     send_packet(chan, ethernet_packet.packet());
 }
 
-fn handle_vlan_packet(ethernet: &EthernetPacket, cfg: &CfgVlans, chan: &mut Chan) {
-    if let Some(vlan) = VlanPacket::new(ethernet.payload()) {
-        let vid = vlan.get_vlan_identifier();
-        if cfg.vlans.contains_key(&vid) {
-            match vlan.get_ethertype() {
-                EtherTypes::Ipv4 => {
-                    chan.stats.ipv4.rx_pkts += 1;
-                    handle_ipv4_packet(vlan.payload(), &cfg.vlans[&vid], Some(vid), chan);
-                }
-                EtherTypes::Ipv6 => {
-                    chan.stats.ipv6.rx_pkts += 1;
-                    handle_ipv6_packet(vlan.payload(), &cfg.vlans[&vid], Some(vid), chan);
-                }
-                EtherTypes::Arp => {
-                    chan.stats.arp.rx_pkts += 1;
-                    handle_arp_packet(ethernet.payload(), &cfg.vlans[&vid], Some(vid), chan);
-                }
-                _ => chan.stats.rx_pkts_dropped_unsupported += 1,
-            }
-        } else {
-            chan.stats.vlan.rx_pkts_dropped_not_for_us += 1;
-        }
-    } else {
-        chan.stats.vlan.rx_pkts_dropped_malformed += 1;
-    }
-}
-
 fn send_vlan_packet(
     dest_mac: MacAddr,
     ethertype: EtherType,
-    vid: u16,
+    vlan_id: u16,
     payload: &[u8],
     chan: &mut Chan,
 ) {
     let buf_size = MutableVlanPacket::minimum_packet_size() + payload.len();
     let mut vlan_packet = MutableVlanPacket::owned(vec![0u8; buf_size]).unwrap();
-    vlan_packet.set_vlan_identifier(vid);
+    vlan_packet.set_vlan_identifier(vlan_id);
     vlan_packet.set_ethertype(ethertype);
     vlan_packet.set_priority_code_point(ClassOfService::new(0));
     vlan_packet.set_drop_eligible_indicator(0); // should always be 0 for Ethernet
@@ -350,7 +283,7 @@ fn send_vlan_packet(
     send_ethernet_packet(dest_mac, EtherTypes::Vlan, vlan_packet.packet(), chan);
 }
 
-fn handle_arp_packet(payload: &[u8], cfg: &CfgIp, vlan_id: Option<u16>, chan: &mut Chan) {
+fn handle_arp_packet(payload: &[u8], cfg: &CfgIp, vlan_id: u16, chan: &mut Chan) {
     if let Some(header) = ArpPacket::new(payload) {
         let dip = header.get_target_proto_addr();
         match cfg.ip {
@@ -393,7 +326,7 @@ fn send_arp_packet(
     target_mac: MacAddr,
     dest_mac: MacAddr,
     operation: ArpOperation,
-    vlan_id: Option<u16>,
+    vlan_id: u16,
     chan: &mut Chan,
 ) {
     let buf_size = MutableArpPacket::minimum_packet_size();
@@ -408,19 +341,20 @@ fn send_arp_packet(
     arp_packet.set_target_hw_addr(target_mac);
     arp_packet.set_target_proto_addr(target_ip);
 
-    if let Some(vid) = vlan_id {
-        send_vlan_packet(dest_mac, EtherTypes::Arp, vid, arp_packet.packet(), chan);
-    } else {
+    if vlan_id == 0 {
         send_ethernet_packet(dest_mac, EtherTypes::Arp, arp_packet.packet(), chan);
+    } else {
+        send_vlan_packet(
+            dest_mac,
+            EtherTypes::Arp,
+            vlan_id,
+            arp_packet.packet(),
+            chan,
+        );
     };
 }
 
-fn send_arp_request(
-    source_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-    vlan_id: Option<u16>,
-    chan: &mut Chan,
-) {
+fn send_arp_request(source_ip: Ipv4Addr, target_ip: Ipv4Addr, vlan_id: u16, chan: &mut Chan) {
     send_arp_packet(
         source_ip,
         target_ip,
@@ -433,7 +367,7 @@ fn send_arp_request(
     chan.stats.arp.tx_pkts_request += 1;
 }
 
-fn handle_ipv4_packet(packet: &[u8], cfg: &CfgIp, vlan_id: Option<u16>, chan: &mut Chan) {
+fn handle_ipv4_packet(packet: &[u8], cfg: &CfgIp, vlan_id: u16, chan: &mut Chan) {
     if let Some(header) = Ipv4Packet::new(packet) {
         // accept packets to both the linknet ip and the svc ip
         let dip = header.get_destination();
@@ -461,7 +395,7 @@ fn send_ipv4_packet(
     destination: Ipv4Addr,
     protocol: IpNextHeaderProtocol,
     payload: &[u8],
-    vlan_id: Option<u16>,
+    vlan_id: u16,
     chan: &mut Chan,
 ) {
     let buf_size = MutableIpv4Packet::minimum_packet_size() + payload.len();
@@ -486,14 +420,20 @@ fn send_ipv4_packet(
     // TODO: implement some buffering and retry if arp resolving failed
     let dest_mac = get_neighbor(vlan_id, IpAddr::V4(destination), chan).unwrap();
 
-    if let Some(vid) = vlan_id {
-        send_vlan_packet(dest_mac, EtherTypes::Ipv4, vid, ip_packet.packet(), chan);
-    } else {
+    if vlan_id == 0 {
         send_ethernet_packet(dest_mac, EtherTypes::Ipv4, ip_packet.packet(), chan);
+    } else {
+        send_vlan_packet(
+            dest_mac,
+            EtherTypes::Ipv4,
+            vlan_id,
+            ip_packet.packet(),
+            chan,
+        );
     };
 }
 
-fn handle_ipv6_packet(packet: &[u8], cfg: &CfgIp, vlan_id: Option<u16>, chan: &mut Chan) {
+fn handle_ipv6_packet(packet: &[u8], cfg: &CfgIp, vlan_id: u16, chan: &mut Chan) {
     if let Some(header) = Ipv6Packet::new(packet) {
         // accept packets to both the linknet ip and the svc ip
         let dip = header.get_destination();
@@ -522,7 +462,7 @@ fn handle_transport_protocol(
     protocol: IpNextHeaderProtocol,
     packet: &[u8],
     svc: &SocketAddr,
-    vlan_id: Option<u16>,
+    vlan_id: u16,
     chan: &mut Chan,
 ) {
     match protocol {
@@ -551,7 +491,7 @@ fn handle_udp_packet(
     destination: IpAddr,
     packet: &[u8],
     svc: &SocketAddr,
-    vlan_id: Option<u16>,
+    vlan_id: u16,
     chan: &mut Chan,
 ) {
     chan.stats.udp.rx_pkts += 1;
@@ -559,8 +499,9 @@ fn handle_udp_packet(
         if udp.get_destination() == svc.port() {
             chan.stats.udp.rx_pkts += 1;
             debug!(
-                "[{}]: UDP Packet received: {}:{} > {}:{}; length: {}",
+                "[{}.{}]: UDP Packet received: {}:{} > {}:{}; length: {}",
                 chan.interface.name,
+                vlan_id,
                 source,
                 udp.get_source(),
                 destination,
@@ -587,8 +528,9 @@ fn handle_udp_packet(
                         chan,
                     );
                     debug!(
-                        "[{}]: UDP Packet sent: {}:{} > {}:{}; length: {}",
+                        "[{}.{}]: UDP Packet sent: {}:{} > {}:{}; length: {}",
                         chan.interface.name,
+                        vlan_id,
                         d,
                         udp_packet.get_source(),
                         s,
@@ -603,7 +545,7 @@ fn handle_udp_packet(
             chan.stats.udp.rx_pkts_dropped_not_for_us += 1;
         }
     } else {
-        chan.stats.udp.rx_pkts_dropped_unsupported += 1
+        chan.stats.udp.rx_pkts_dropped_malformed += 1
     }
 }
 
@@ -611,7 +553,7 @@ fn handle_icmp_packet(
     source: Ipv4Addr,
     destination: Ipv4Addr,
     packet: &[u8],
-    vlan_id: Option<u16>,
+    vlan_id: u16,
     chan: &mut Chan,
 ) {
     chan.stats.icmp4.rx_pkts += 1;
@@ -624,8 +566,9 @@ fn handle_icmp_packet(
                 chan.stats.icmp4.rx_pkts_request += 1;
                 let echo_request_packet = echo_request::EchoRequestPacket::new(packet).unwrap();
                 debug!(
-                    "[{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
+                    "[{}.{}]: ICMP echo request {} -> {} (seq={:?}, id={:?})",
                     chan.interface.name,
+                    vlan_id,
                     source,
                     destination,
                     echo_request_packet.get_sequence_number(),
@@ -648,8 +591,9 @@ fn handle_icmp_packet(
                     chan,
                 );
                 debug!(
-                    "[{}]: ICMP echo reply   {} -> {} (seq={:?}, id={:?})",
+                    "[{}.{}]: ICMP echo reply   {} -> {} (seq={:?}, id={:?})",
                     chan.interface.name,
+                    vlan_id,
                     destination,
                     source,
                     echo_request_packet.get_sequence_number(),
@@ -658,8 +602,9 @@ fn handle_icmp_packet(
                 chan.stats.icmp4.tx_pkts_reply += 1;
             }
             _ => debug!(
-                "[{}]: ICMP packet received {} -> {} (type={:?})",
+                "[{}.{}]: ICMP packet received {} -> {} (type={:?})",
                 chan.interface.name,
+                vlan_id,
                 source,
                 destination,
                 icmp_packet.get_icmp_type()
